@@ -1,0 +1,65 @@
+[package]
+name = "vice-city-web"
+version = "0.1.0"
+edition = "2024"
+description = "GTA Vice City 风格开放世界浏览器游戏(euv + Rust → WASM)"
+license = "MIT"
+publish = false
+
+[lib]
+name = "vice_city_web"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+euv = "0.28.2"
+js-sys = "0.3"
+serde_json = "1"
+euv-engine = "0.28.2"
+wasm-bindgen = "0.2.129"
+console_error_panic_hook = "0.1"
+serde = { version = "1", features = ["derive"] }
+wasm-bindgen-futures = "0.4"
+# web-sys 仅用于「开启 feature」,类型统一走 euv 重导出的那份,
+# 保证与 euv-engine 内部使用的是同一个 web-sys 实例。
+web-sys = { version = "0.3", features = [
+  "Node",
+  "Event",
+  "Touch",
+  "Window",
+  "DomRect",
+  "Element",
+  "Headers",
+  "Request",
+  "console",
+  "Document",
+  "DomPoint",
+  "Response",
+  "EventInit",
+  "TouchList",
+  "FocusEvent",
+  "MouseEvent",
+  "TouchEvent",
+  "WheelEvent",
+  "EventTarget",
+  "HtmlElement",
+  "Performance",
+  "RequestInit",
+  "WebGlBuffer",
+  "WebGlShader",
+  "PointerEvent",
+  "WebGlProgram",
+  "KeyboardEvent",
+  "HtmlInputElement",
+  "HtmlCanvasElement",
+  "CssStyleDeclaration",
+  "WebGlUniformLocation",
+  "WebGl2RenderingContext",
+  "WebGlVertexArrayObject",
+  "CanvasRenderingContext2d",] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <!-- 移动端 viewport:禁止用户缩放,canvas 铺满可视区 -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#1a1030" />
+    <meta
+      name="description"
+      content="NEON BAY — a GTA Vice City flavoured open-world browser game rendered with Rust → WebAssembly (euv + WebGL2)."
+    />
+    <title>NEON BAY · Vice City Web</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: #10121c;
+        /* 移动端安全区:刘海 / home indicator */
+        padding: env(safe-area-inset-top) env(safe-area-inset-right)
+          env(safe-area-inset-bottom) env(safe-area-inset-left);
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        -webkit-tap-highlight-color: transparent;
+        overscroll-behavior: none;
+      }
+      #app {
+        position: relative;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+      }
+      canvas {
+        display: block;
+        touch-action: none;
+        user-select: none;
+        -webkit-user-select: none;
+      }
+      /* wasm 还在下载时的第一屏加载态(被 Rust 侧进度条接管后隐藏) */
+      #boot {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 18px;
+        background: linear-gradient(160deg, #1a1030 0%, #2b1246 55%, #06202e 100%);
+        color: #ffd9f2;
+        letter-spacing: 0.3em;
+        z-index: 100;
+      }
+      #boot .title {
+        font-size: 26px;
+        color: #ff7ad9;
+        text-shadow: 0 0 18px rgba(255, 122, 217, 0.75);
+      }
+      #boot .sub {
+        font-size: 11px;
+        letter-spacing: 0.34em;
+        color: #7dfcff;
+      }
+      #boot .track {
+        width: min(340px, 70vw);
+        height: 8px;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.12);
+        overflow: hidden;
+      }
+      #boot .bar {
+        width: 8%;
+        height: 100%;
+        border-radius: 999px;
+        background: linear-gradient(90deg, #ff7ad9, #7dfcff);
+        animation: boot-slide 1.4s ease-in-out infinite;
+      }
+      #boot .msg {
+        font-size: 11px;
+        letter-spacing: 0.14em;
+        color: #e6d4ff;
+      }
+      @keyframes boot-slide {
+        0% {
+          margin-left: 0%;
+        }
+        50% {
+          margin-left: 46%;
+        }
+        100% {
+          margin-left: 92%;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <div id="boot">
+        <div class="title">VICE CITY</div>
+        <div class="sub">WASM EDITION</div>
+        <div class="track"><div class="bar"></div></div>
+        <div class="msg" id="boot-msg">downloading wasm…</div>
+      </div>
+    </div>
+
+    <script type="module">
+      // ---------------------------------------------------------------------
+      // 相对路径引导:GitHub Pages 部署在 https://<owner>.github.io/<repo>/,
+      // 绝对路径 "/pkg/..." 会 404。这里用 import.meta.url 推导 base,
+      // 于是 https://host/repo/ 和 https://host/repo/index.html 都能工作。
+      // ---------------------------------------------------------------------
+      const bootMsg = document.getElementById("boot-msg");
+
+      function setBootMessage(text) {
+        if (bootMsg) bootMsg.textContent = text;
+      }
+
+      // './pkg/vice_city_web.js' —— 相对于当前文档,适配任意子路径。
+      import("./pkg/vice_city_web.js")
+        .then((module) => {
+          // wasm-bindgen --target web 的默认 init 接受显式的 wasm URL,
+          // 这里再兜一次底:即使模块解析成功,也能把 wasm 定位到 ./pkg/。
+          const wasmUrl = new URL("./pkg/vice_city_web_bg.wasm", import.meta.url);
+          return module.default({ module_or_path: wasmUrl }).then(() => module);
+        })
+        .then((module) => {
+          // init() 只负责实例化 wasm;入口 `main()` 必须显式调用。
+          // `main()` 里做 console_error_panic_hook + App::mount + boot()。
+          module.main();
+          setBootMessage("ready");
+          const boot = document.getElementById("boot");
+          if (boot) boot.remove();
+          console.log("[vcw] wasm module loaded, main() invoked");
+        })
+        .catch((error) => {
+          console.error("[vcw] wasm load failed", error);
+          setBootMessage("wasm load failed: " + error);
+        });
+    </script>
+  </body>
+</html>

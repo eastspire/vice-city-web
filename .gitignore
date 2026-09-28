@@ -4,3 +4,9 @@ www/pkg/
 node_modules/
 .DS_Store
 *.log
+__pycache__/
+*.pyc
+# Local-dev symlink to ../assets so `python3 -m http.server --directory www`
+# can serve them. Never commit it: Pages would receive a dangling link, and
+# the deploy workflow stages real files into www/assets itself.
+www/assets
