@@ -59,18 +59,30 @@ pub const FLOATS_PER_INSTANCE: usize = 20;
 /// 不会重新绑定,部分驱动上会渲染出未初始化内存。
 const INSTANCE_PREALLOC: usize = 64;
 
-/// 近处遮挡剔除半径(米)。
+/// 自由观察(轨道)模式的近处遮挡剔除半径(米)。
 ///
 /// 默认机位在街区斜上方俯视,落在近处的行道树 / 路灯会糊住半个屏幕
 /// (9 m 高的棕榈离眼点只有十几米,一层树叶就是一整屏)。这不是几何错误,
-/// 是「相机正好在物体旁边」——靠挪机位只能顾此失彼,用户自己滚轮拉近
-/// 时同样会遇到,所以在渲染器里按实例中心到眼点的距离统一剔掉。
+/// 是「相机正好在物体旁边」——靠挪机位只能顾此失彼,所以在渲染器里按
+/// 实例中心到眼点的距离统一剔掉。
 ///
 /// 半径取 26 m。默认机位在 z≈56、y≈38 处俯视,行道树在 z=14/30/42,
 /// 距离分别是 26/13/11 m —— 26 m 正好把「压在镜头上的」那三棵剔掉,
-/// 同时保住 z≤-20 那一排(60+ m)给街景留纵深。再往外就会把整条
-/// 人行道剃光,画面会变得像空地。
+/// 同时保住 z≤-20 那一排(60+ m)给街景留纵深。
+///
+/// **只对自由观察有效。** 第三人称相机的眼点离角色只有 7 m 上下,26 m
+/// 半径会把整条街的楼、行道树、路灯**全部**剔光,画面只剩地面和天空
+/// (实测第三人称取样只有 34 种颜色、轨道机位 4571 种)。第三人称用
+/// `NEAR_CULL_RADIUS_FOLLOW` —— 见那里的说明。
 pub const NEAR_CULL_RADIUS: f32 = 26.0;
+
+/// 第三人称模式的近处遮挡剔除半径(米)。
+///
+/// 必须远小于 `NEAR_CULL_RADIUS`,因为第三人称眼点本来就**故意**贴着
+/// 一切走:角色 7 m、路缘 8 m、对面楼 12 m。这个半径只负责剔掉「真的
+/// 糊在镜头上」的东西(半径内 = 半米量级),遮挡由相机的球体探针负责
+/// 回避 —— 两者是互补的,不是重复的。
+pub const NEAR_CULL_RADIUS_FOLLOW: f32 = 0.35;
 
 /// 实例中心到眼点的距离(取模型矩阵的平移列)。
 ///
@@ -251,6 +263,19 @@ pub enum DayPhase {
 }
 
 impl DayPhase {
+    /// 相位名(HUD 与调试快照用)。
+    ///
+    /// # Returns
+    ///
+    /// - `&'static str` - 相位名。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DayPhase::Noon => PHASE_NOON,
+            DayPhase::Dusk => PHASE_DUSK,
+            DayPhase::Night => PHASE_NIGHT,
+        }
+    }
+
     /// 下一个相位(循环)。
     pub fn next(self) -> Self {
         match self {
@@ -318,6 +343,10 @@ pub struct SceneLighting {
     pub sky_color: Vec3,
     /// 自发光全局增益(夜晚更大)。
     pub emissive_gain: f32,
+    /// 色调映射的曝光系数(线性域乘子)。
+    pub exposure: f32,
+    /// 色调映射的白色点(亮度超过这个值就开始明显压缩高光)。
+    pub tone_map_white: f32,
     /// 大气雾:起始距离(米)。比这更近的物体完全不受雾影响。
     pub fog_start: f32,
     /// 大气雾:完全饱和的距离(米)。
@@ -331,69 +360,155 @@ impl SceneLighting {
     ///
     /// - `DayPhase` - 输入值。
     pub fn for_phase(phase: DayPhase) -> Self {
+        // 三相位的共同约束(数值都在 GPU / CPU 两端共用):
+        //
+        // 1. **朝光面总亮度可控。** 朝光面的线性亮度是
+        //    `albedo * (ambient + light_color * n_dot_l)`。最亮的白色楼
+        //    albedo 接近 0.86,如果 `ambient + light_color` 直接取到 2.0,
+        //    线性值就是 1.7 —— 远超 1.0,`clamp` 之后所有浅色面一律糊成
+        //    纯白,色相信息(粉 / 薄荷 / 珊瑚)在 sRGB 之前就已经被抹掉了。
+        //    这里把三相位的 `ambient + light_color` 都压在 ~1.6 以内,
+        //    剩下的高光交给 [`tonemap`] 的肩部压缩。
+        // 2. **曝光固定为 1.0,靠白色点而不是靠压暗光强来「解决」过曝。**
+        //    压暗方向光会让阴影面一起塌死;抬高白色点则保住中间调的
+        //    色相,只把真正刺眼的顶端收进来。
+        // 3. **夜晚不能死黑。** 环境光带一点蓝紫(城市天光 + 霓虹回弹),
+        //    所以夜里路面和楼体仍然可辨,只是整体偏冷偏暗。
         match phase {
             DayPhase::Noon => Self {
                 light_dir: normalize3([0.35, 0.86, 0.36]),
-                // 正午原来给到 1.02 + 0.40 环境光,叠加后接近 1.4,
-                // 浅色楼顶直接顶到 255 糊成一片白。把方向光收一点、
-                // 环境光压低,让立面和屋顶的明暗差拉开。
-                light_color: [0.86, 0.83, 0.76],
-                ambient: [0.26, 0.30, 0.38],
-                sky_color: [0.47, 0.78, 0.94],
+                // 方向光接近中性白(略偏暖),环境光偏天空蓝 —— 阴影面
+                // 因此是冷蓝而不是灰,和阳光面的暖白拉开冷暖对比。
+                light_color: [1.16, 1.10, 0.99],
+                ambient: [0.34, 0.38, 0.46],
+                sky_color: [0.44, 0.70, 0.92],
                 emissive_gain: 0.18,
-                // 机位在 ~58 m 外、街道沿 Z 有 96 m,雾要刚好只吃掉
-                // 最远那一两栋楼,不能压到近景。
-                fog_start: 78.0,
-                fog_end: 250.0,
+                exposure: 1.0,
+                tone_map_white: TONE_MAP_WHITE_DAY,
+                // 街区扩到 ±150 m,雾必须够远才看得到成片的街区;
+                // fog_start 压到接近雾的起点,远景褪向天空色而不是突然消失。
+                fog_start: 120.0,
+                fog_end: 460.0,
             },
             DayPhase::Dusk => Self {
                 light_dir: normalize3([0.86, 0.24, -0.44]),
-                light_color: [1.05, 0.58, 0.34],
-                ambient: [0.24, 0.21, 0.32],
-                sky_color: [0.98, 0.52, 0.42],
-                emissive_gain: 0.85,
-                fog_start: 62.0,
-                fog_end: 240.0,
+                // 低角度暖橙直射 + 偏紫的天空环境光:朝光面是橙红,
+                // 背光面落到冷紫,这是黄昏最主要的色相来源。
+                light_color: [1.62, 0.84, 0.42],
+                ambient: [0.26, 0.24, 0.40],
+                sky_color: [0.95, 0.46, 0.36],
+                emissive_gain: 0.90,
+                exposure: 1.0,
+                tone_map_white: TONE_MAP_WHITE_DUSK,
+                fog_start: 100.0,
+                fog_end: 420.0,
             },
             DayPhase::Night => Self {
                 light_dir: normalize3([-0.42, 0.72, -0.55]),
-                light_color: [0.26, 0.33, 0.58],
-                ambient: [0.10, 0.13, 0.24],
-                sky_color: [0.05, 0.06, 0.14],
+                // 月光很弱,但刻意保留蓝紫偏色;环境光是全画面「不死黑」
+                // 的唯一来源 —— 路面 / 楼体靠它提亮,而不是把直射光调大。
+                light_color: [0.24, 0.31, 0.58],
+                ambient: [0.11, 0.14, 0.26],
+                sky_color: [0.045, 0.055, 0.13],
                 emissive_gain: 1.85,
-                fog_start: 55.0,
-                fog_end: 220.0,
+                exposure: 1.0,
+                tone_map_white: TONE_MAP_WHITE_NIGHT,
+                fog_start: 90.0,
+                fog_end: 400.0,
             },
         }
     }
 }
 
+/// 线性亮度权重(Rec. 709 / sRGB 的 Y)。
+const LUMA_WEIGHTS: Vec3 = [0.2126, 0.7152, 0.0722];
+
+/// 单个线性亮度的 Reinhard 扩展色调映射(有肩部的高光滚降)。
+///
+/// 标准 Reinhard 是 `L / (1 + L)`,它把 L=1 映射到 0.5 —— 也就是说
+/// 一个「正常曝光」的白色面在 sRGB 编码后只有 ~188/255,整个画面永远
+/// 偏暗发灰。扩展版(Jim Hejl / Richard Burgess-Dawson 的 W 参数化)
+/// 满足 `f(W) = 1`,即**白色点恰好映射到 1.0**,中间调保持线性感,
+/// 只有超过 `white` 的部分才进肩部压缩:
+///
+/// ```text
+/// f(L) = L * (1 + L / W²) / (1 + L)
+/// ```
+///
+/// 这正是「过曝」的正确解法:压的是高光顶端,不是把光强整体调暗。
+///
+/// # Arguments
+///
+/// - `f32` - 线性亮度(非负)。
+/// - `f32` - 曝光系数(线性域乘子)。
+/// - `f32` - 白色点(必须 > 0)。
+///
+/// # Returns
+///
+/// - `f32` - 映射后的线性亮度,落在 `[0, 1)`。
+pub fn tonemap_luma(luma: f32, exposure: f32, white: f32) -> f32 {
+    let w: f32 = if white > f32::EPSILON { white } else { 1.0 };
+    let x: f32 = if luma > 0.0 { luma } else { 0.0 } * exposure;
+    let w2: f32 = w * w;
+    x * (1.0 + x / w2) / (1.0 + x)
+}
+
+/// 按亮度做色相保持(color-preserving)的色调映射。
+///
+/// 逐通道独立映射会把过曝的亮面直接去色 —— 一个亮度 1.7 的粉红面
+/// 逐通道 clamp 后是 (1.0, 1.0, 1.0),纯白;而同一个面如果按亮度整体
+/// 缩放,R:G:B 的比例被保留,仍然读得出是粉红。所以这里只对**亮度**
+/// 做色调映射,再按 `f(L') / (L * exposure)` 的比例把颜色整体缩放回去,
+/// 即保留色相与饱和度关系,只压亮度。
+///
+/// 纯黑(`luma <= 0`)直接原样返回,避免除零。
+///
+/// # Arguments
+///
+/// - `Vec3` - 线性 RGB(未做曝光与色调映射)。
+/// - `f32` - 曝光系数(线性域乘子)。
+/// - `f32` - 白色点(必须 > 0)。
+///
+/// # Returns
+///
+/// - `Vec3` - 色调映射后的线性 RGB。
+pub fn tonemap(value: Vec3, exposure: f32, white: f32) -> Vec3 {
+    let luma: f32 =
+        value[0] * LUMA_WEIGHTS[0] + value[1] * LUMA_WEIGHTS[1] + value[2] * LUMA_WEIGHTS[2];
+    if luma <= 1e-6 {
+        return [0.0, 0.0, 0.0];
+    }
+    let mapped: f32 = tonemap_luma(luma, exposure, white);
+    let divisor: f32 = luma * exposure;
+    let scale: f32 = if divisor > f32::EPSILON {
+        mapped / divisor
+    } else {
+        1.0
+    };
+    [value[0] * scale, value[1] * scale, value[2] * scale]
+}
+
 /// 两个后端共用的平面着色公式。
 ///
 /// ```
-/// color = albedo * (ambient + light_color * max(dot(normal, light_dir), 0))
-///         + albedo * emissive * emissive_gain
+/// base   = albedo * tint
+/// lit    = base * (ambient + light_color * max(dot(normal, light_dir), 0))
+///        + base * emissive * emissive_gain
+/// color  = tonemap(lit, exposure, tone_map_white)   // 线性域,色相保持
+///        + sky_color * SKY_TINT_GAIN                  // 天空色晕染
+/// color  = mix(color, sky_color, fog)                // 大气雾
+/// out    = linear_to_srgb(color)
 /// ```
 ///
-/// 线性空间计算,最后 [`linear_to_srgb`] 转成显示用的 sRGB。
+/// **色相为什么必须保住(这正是「一片惨白」的历史根因):**
+/// 资产颜色按 `assets/SCHEMA.md` 是**线性** albedo,浅色面的亮度
+/// 可以接近 0.86。经过 `ambient + light_color * n_dot_l` 之后,朝光面
+/// 的线性亮度会到 1.5~1.9 —— 远超 1.0。如果这里逐通道 `clamp` 或逐通道
+/// 映射,(1.5, 1.2, 1.4) 会被压成 (1, 1, 1),粉红面和薄荷面全部变成
+/// 纯白,「有颜色」在 sRGB 编码之前就已经丢失了。色相保持的映射把
+/// 亮度压到 1.0 以下,R:G:B 的比例不变,浅粉仍然读得出是浅粉。
+///
 /// `eye_distance` 是面中心到相机眼点的距离(米),用于大气雾。
-///
-/// 雾的作用:街区沿 Z 轴有 96 m,没有雾时远端楼面因为背光而塌成一片死黑,
-/// 有了雾之后远景自然褪向天空色,既补上了深度线索,又让路面 / 天空
-/// 分得开(正午时两者本来亮度接近)。
-/// 两个后端共用的平面着色公式。
-///
-/// ```
-/// color = albedo * (ambient + light_color * max(dot(normal, light_dir), 0))
-///         + albedo * emissive * emissive_gain
-/// ```
-///
-/// 线性空间计算,最后 [`linear_to_srgb`] 转成显示用的 sRGB。
-/// `eye_distance` 是面中心到相机眼点的距离(米),用于大气雾。
-///
-/// 雾的作用:街区沿 Z 轴有 96 m,没有雾时远端楼面因为背光而塌成一片死黑,
-/// 有了雾之后远景自然褪向天空色,既补上了深度线索,又让路面 / 天空
-/// 分得开(正午时两者本来亮度接近)。
 ///
 /// # Arguments
 ///
@@ -424,9 +539,14 @@ pub fn shade_face(
     let mut out: [f32; 3] = [0.0; 3];
     for channel in 0..3 {
         let diffuse: f32 = lighting.ambient[channel] + lighting.light_color[channel] * n_dot_l;
-        out[channel] = base[channel] * diffuse
-            + base[channel] * emissive[channel] * lighting.emissive_gain
-            + lighting.sky_color[channel] * 0.012;
+        out[channel] =
+            base[channel] * diffuse + base[channel] * emissive[channel] * lighting.emissive_gain;
+    }
+    // 色调映射(色相保持)+ 天空色晕染。顺序很重要:先在线性域压亮度,
+    // 再加天空色,最后才是 sRGB 编码。
+    let mut mapped: [f32; 3] = tonemap(out, lighting.exposure, lighting.tone_map_white);
+    for channel in 0..3 {
+        mapped[channel] += lighting.sky_color[channel] * SKY_TINT_GAIN;
     }
     // 大气雾:线性空间里向天空色插值,自发光通道不吃雾(夜里霓虹要穿透雾)。
     let span: f32 = (lighting.fog_end - lighting.fog_start).max(f32::EPSILON);
@@ -435,14 +555,14 @@ pub fn shade_face(
     let self_lit: f32 = base[0] * emissive[0] + base[1] * emissive[1] + base[2] * emissive[2];
     if self_lit > 0.01 {
         let glow: f32 = (fog * 0.72).min(0.72);
-        for (channel, sky) in out.iter_mut().zip(lighting.sky_color.iter()) {
+        for (channel, sky) in mapped.iter_mut().zip(lighting.sky_color.iter()) {
             *channel += sky * glow;
         }
     }
-    for (channel, sky) in out.iter_mut().zip(lighting.sky_color.iter()) {
+    for (channel, sky) in mapped.iter_mut().zip(lighting.sky_color.iter()) {
         *channel = *channel * (1.0 - fog) + sky * fog;
     }
-    linear_to_srgb(out)
+    linear_to_srgb(mapped)
 }
 
 /// 线性 → sRGB 传输函数(与 `assets/SCHEMA.md` §2「linear RGB, apply the
@@ -568,6 +688,26 @@ impl Instance {
         }
     }
 
+    /// 用一条显式的 model matrix 构造实例。
+    ///
+    /// 玩家的步态骨架需要「局部肢体摆动矩阵 × 整体位置 / 朝向」,不再是
+    /// 单纯的 TRS,所以给渲染器开一个直接吃矩阵的入口。
+    ///
+    /// # Arguments
+    ///
+    /// - `Mat4` - 列主序的 model matrix。
+    /// - `Vec3` - 逐实例色调乘子。
+    ///
+    /// # Returns
+    ///
+    /// - `Self` - 构造好的实例。
+    pub fn from_matrix(model: Mat4, tint: Vec3) -> Self {
+        Self {
+            model: *model.get_elements(),
+            tint,
+        }
+    }
+
     /// 用 model matrix 变换一个点。
     ///
     /// # Arguments
@@ -612,6 +752,13 @@ pub struct SceneBatch {
     pub instances: Vec<Instance>,
     /// 是否参与深度测试 / 背面剔除(地面与透明片为 false)。
     pub opaque: bool,
+    /// 是否参与「近处遮挡剔除」(见 [`NEAR_CULL_RADIUS`])。
+    ///
+    /// 第三人称模式下相机离角色只有 4–7 m,而近处剔除半径是 26 m ——
+    /// 如果不豁免,玩家身上的每一块 part 都会被剔掉,画面里根本没有角色。
+    /// 玩家骨架批次因此固定为 `false`,车辆批次也关掉(车灯要在近处
+    /// 看清楚)。地面 / 建筑 / 树保持 `true`。
+    pub near_cull: bool,
 }
 
 /// 整个场景:资产表 + 批次表。
@@ -683,11 +830,32 @@ impl Scene {
     ///
     /// - `usize` - 计数结果。
     pub fn push_batch(&mut self, mesh_index: usize, opaque: bool) -> usize {
+        self.push_batch_with_cull(mesh_index, opaque, true)
+    }
+
+    /// 新建一个批次,并显式指定它是否参与近处遮挡剔除。
+    ///
+    /// # Arguments
+    ///
+    /// - `usize` - 资产索引。
+    /// - `bool` - 是否参与深度测试 / 背面剔除。
+    /// - `bool` - 是否参与近处遮挡剔除。
+    ///
+    /// # Returns
+    ///
+    /// - `usize` - 新批次的索引。
+    pub fn push_batch_with_cull(
+        &mut self,
+        mesh_index: usize,
+        opaque: bool,
+        near_cull: bool,
+    ) -> usize {
         let index: usize = self.get_batches_mut().len();
         self.get_batches_mut().push(SceneBatch {
             mesh_index,
             instances: Vec::new(),
             opaque,
+            near_cull,
         });
         index
     }
@@ -775,9 +943,11 @@ void main() {
 }
 "#;
 
-/// 片元着色器:方向光漫反射 + 环境光 + 自发光(夜间霓虹)+ 天空色晕染。
+/// 片元着色器:方向光漫反射 + 环境光 + 自发光(夜间霓虹)+ 色调映射 + 雾。
 ///
-/// 与 [`shade_face`] 同一个公式,保证两个后端视觉一致。
+/// 与 [`shade_face`] 同一个公式(逐项对应 `shade_face` 的注释),
+/// 保证两个后端视觉一致。**不要在这里改写光照顺序或色彩空间** ——
+/// 任何一侧偏离,WebGL 与 Canvas2D 回退就会画出两种颜色。
 const FRAGMENT_SHADER: &str = r#"#version 300 es
 precision highp float;
 
@@ -794,8 +964,12 @@ uniform vec3 u_sky_color;
 uniform float u_emissive_gain;
 uniform vec2 u_fog;          // x = fog_start, y = fog_end
 uniform vec3 u_eye;
+uniform float u_exposure;      // 曝光系数(线性域乘子)
+uniform float u_tone_map_white; // 色调映射白色点
 
 out vec4 out_color;
+
+const vec3 LUMA_WEIGHTS = vec3(0.2126, 0.7152, 0.0722);
 
 vec3 linear_to_srgb(vec3 value) {
     vec3 low = value * 12.92;
@@ -804,13 +978,34 @@ vec3 linear_to_srgb(vec3 value) {
     return mix(low, high, use_high);
 }
 
+// Reinhard 扩展色调映射(白色点归一化):f(L) = L*(1+L/W^2)/(1+L)。
+// 满足 f(W)=1,中间调保持线性,只把超过白色点的顶端压进肩部。
+float tonemap_luma(float luma, float exposure, float white) {
+    float w = max(white, 1e-4);
+    float x = max(luma, 0.0) * exposure;
+    return x * (1.0 + x / (w * w)) / (1.0 + x);
+}
+
+// 色相保持:只压亮度再按比例缩回颜色,保留 R:G:B 比例(= 色相)。
+// 逐通道映射会把过曝亮面去色成纯白,这是「一片惨白」的经典成因。
+vec3 tonemap(vec3 value, float exposure, float white) {
+    float luma = dot(value, LUMA_WEIGHTS);
+    if (luma <= 1e-6) {
+        return vec3(0.0);
+    }
+    float mapped = tonemap_luma(luma, exposure, white);
+    float divisor = luma * exposure;
+    float scale = divisor > 1e-6 ? mapped / divisor : 1.0;
+    return value * scale;
+}
+
 void main() {
     vec3 normal = normalize(v_normal);
     float n_dot_l = max(dot(normal, u_light_dir), 0.0);
-    vec3 base = vec3(0.5); // TEMP
+    // 资产自带的线性 albedo × 逐实例 tint。
+    vec3 base = v_color * v_tint;
     vec3 lit = base * (u_ambient + u_light_color * n_dot_l)
-             + base * v_emissive * u_emissive_gain
-             + u_sky_color * 0.012;
+             + base * v_emissive * u_emissive_gain;
 
     // 大气雾:与 CPU 端 shade_face() 同一个 smoothstep 插值。
     float span = max(u_fog.y - u_fog.x, 1e-4);
@@ -818,6 +1013,7 @@ void main() {
     fog = fog * fog * (3.0 - 2.0 * fog);
     // 自发光面(霓虹 / 路灯)在雾里额外加一点光晕,夜里更醒目。
     float energy = dot(base * v_emissive, vec3(1.0));
+    lit = tonemap(lit, u_exposure, u_tone_map_white) + u_sky_color * 0.012;
     if (energy > 0.01) {
         lit += u_sky_color * min(fog * 0.72, 0.72);
     }
@@ -884,6 +1080,8 @@ pub struct WebGlRenderer {
     uniform_emissive_gain: Option<WebGlUniformLocation>,
     uniform_fog: Option<WebGlUniformLocation>,
     uniform_eye: Option<WebGlUniformLocation>,
+    uniform_exposure: Option<WebGlUniformLocation>,
+    uniform_tone_map_white: Option<WebGlUniformLocation>,
     uniform_glow_strength: Option<WebGlUniformLocation>,
     /// 所有批次共享的 instance buffer(按最大实例数预分配)。
     instance_buffer: WebGlBuffer,
@@ -990,6 +1188,24 @@ impl WebGlRenderer {
     /// - `Option<&WebGlUniformLocation>` - uniform 位置。
     pub fn get_uniform_eye(&self) -> Option<&WebGlUniformLocation> {
         self.uniform_eye.as_ref()
+    }
+
+    /// 曝光系数 uniform 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_exposure(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_exposure.as_ref()
+    }
+
+    /// 色调映射白色点 uniform 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_tone_map_white(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_tone_map_white.as_ref()
     }
 
     /// 泛光强度 uniform 的位置。
@@ -1179,8 +1395,29 @@ impl WebGlRenderer {
     ///
     /// - `Result<Self, String>` - 计算结果。
     pub fn new(canvas: &HtmlCanvasElement) -> Result<Self, String> {
+        // `getContext` 的第二个参数是 `ContextAttributes`:
+        // - `depth: true`  —— 要深度缓冲;
+        // - `antialias: false` —— 城市是硬边低多边形,MSAA 在软件光栅上
+        //   代价太高,换来的是肉眼几乎看不出的边缘;
+        // - **`depth` 不指定 `stencil: false`** 会让浏览器连 16 位模板一起
+        //   分配,在 swiftshader 上深度缓冲可能因此被降到 16 位,近距离
+        //   几何全部 z-fighting(第三人称贴着地面看只剩一片单色)。
+        let attributes: JsValue = JsValue::from(js_sys::Object::new());
+        for (name, value) in [
+            (crate::r#const::GL_ATTR_ALPHA, false),
+            (crate::r#const::GL_ATTR_DEPTH, true),
+            (crate::r#const::GL_ATTR_STENCIL, false),
+            (crate::r#const::GL_ATTR_ANTIALIAS, false),
+            (crate::r#const::GL_ATTR_PRESERVE_DRAWING_BUFFER, true),
+        ] {
+            let _ = js_sys::Reflect::set(
+                &attributes,
+                &JsValue::from_str(name),
+                &JsValue::from_bool(value),
+            );
+        }
         let context: WebGl2RenderingContext = canvas
-            .get_context(WEBGL2_2)
+            .get_context_with_context_options(WEBGL2_2, &attributes)
             .map_err(|err: JsValue| format!("get_context threw: {err:?}"))?
             .ok_or_else(|| WEBGL2_UNAVAILABLE.to_string())?
             .dyn_into_webgl();
@@ -1220,6 +1457,10 @@ impl WebGlRenderer {
             context.get_uniform_location(&program, U_EMISSIVE_GAIN);
         let u_fog: Option<WebGlUniformLocation> = context.get_uniform_location(&program, U_FOG);
         let u_eye: Option<WebGlUniformLocation> = context.get_uniform_location(&program, U_EYE);
+        let u_exposure: Option<WebGlUniformLocation> =
+            context.get_uniform_location(&program, U_EXPOSURE);
+        let u_tone_map_white: Option<WebGlUniformLocation> =
+            context.get_uniform_location(&program, U_TONE_MAP_WHITE);
         let u_glow_strength: Option<WebGlUniformLocation> =
             context.get_uniform_location(&glow_program, U_GLOW_STRENGTH);
         let gl_context: WebGl2RenderingContext = context.clone();
@@ -1236,6 +1477,8 @@ impl WebGlRenderer {
             uniform_emissive_gain: u_emissive_gain,
             uniform_fog: u_fog,
             uniform_eye: u_eye,
+            uniform_exposure: u_exposure,
+            uniform_tone_map_white: u_tone_map_white,
             uniform_glow_strength: u_glow_strength,
             instance_buffer,
             instance_capacity: INSTANCE_PREALLOC,
@@ -1243,7 +1486,7 @@ impl WebGlRenderer {
         };
 
         gl_context.enable(WebGl2RenderingContext::DEPTH_TEST);
-        gl_context.depth_func(WebGl2RenderingContext::LEQUAL);
+        gl_context.depth_func(WebGl2RenderingContext::LESS);
         gl_context.enable(WebGl2RenderingContext::CULL_FACE);
         gl_context.cull_face(WebGl2RenderingContext::BACK);
         gl_context.enable(WebGl2RenderingContext::BLEND);
@@ -1256,13 +1499,24 @@ impl WebGlRenderer {
 
     /// 上传一个资产的顶点 / 索引,并创建带实例布局的 VAO。
     ///
+    /// **每个 mesh 只能调用一次。** 本函数是 `push` 语义:在
+    /// `self.meshes` 尾部追加并返回 `len - 1`。而 `SceneBatch::mesh_index`
+    /// 是 `Scene::meshes` 的下标,`draw_batch` 把它**直接**当作
+    /// `self.meshes` 的下标来取 VAO —— 两者只有在「每个 `Scene::meshes`
+    /// 元素恰好上传一次」时才成立。
+    ///
+    /// 同一个 mesh 上传两次会让 GPU 表多出一整轮,之后所有下标整体错位:
+    /// 尾部新加的批次(玩家 13 个骨架 part)取到的是**重传那一轮的旧
+    /// 资产**,于是几栋几十米高的楼被按 1.75 米小人的 model matrix 摆到
+    /// 玩家脚下糊满屏幕,而角色真正的 mesh 一次都没画过。
+    ///
     /// # Arguments
     ///
     /// - `&MeshAssetGpu` - MeshAssetGpu 的只读引用。
     ///
     /// # Returns
     ///
-    /// - `Result<usize, String>` - 计算结果。
+    /// - `Result<usize, String>` - 新追加的 GPU mesh 索引。
     pub fn upload_mesh(&mut self, mesh: &MeshAssetGpu) -> Result<usize, String> {
         let context: WebGl2RenderingContext = self.get_context();
         let vertex_array: WebGlVertexArrayObject = context
@@ -1379,8 +1633,10 @@ impl WebGlRenderer {
     /// - `&Scene` - Scene 的只读引用。
     /// - `&Mat4` - Mat4 的只读引用。
     /// - `&SceneLighting` - SceneLighting 的只读引用。
-    /// - `Vec3` - 输入值。
-    /// - `u32` - 输入值。
+    /// - `Vec3` - 相机眼点世界坐标。
+    /// - `u32` - 画布宽度(像素)。
+    /// - `u32` - 画布高度(像素)。
+    /// - `f32` - 本帧的近处遮挡剔除半径(米):第三人称与自由观察不同。
     ///
     /// # Returns
     ///
@@ -1393,6 +1649,7 @@ impl WebGlRenderer {
         eye: Vec3,
         width: u32,
         height: u32,
+        near_cull_radius: f32,
     ) -> Result<u32, String> {
         // `WebGl2RenderingContext` 是 Clone 的 JS handle:克隆一份让
         // `context` 独立于 `&mut self`,这样 `draw_batch(&mut self, ..)`
@@ -1410,6 +1667,15 @@ impl WebGlRenderer {
         );
 
         // 不透明物体:关混合,正常深度测试。
+        //
+        // **`depth_mask(true)` 必须每帧显式打开。** 泛光 pass 结束时用
+        // `depth_mask(false)` 关掉了深度写入却没有恢复:从第二帧起整幅
+        // 深度缓冲就再也写不进去,深度测试对每一对重叠面都判成
+        // `LEQUAL` 通过,于是「最后画的那个批次」覆盖掉整屏 —— 第三人称
+        // 贴着地面看过去,整帧只剩一两种颜色,整座城市(和角色)全被抹掉。
+        // 自由观察机位在 200 m 外,批次之间很少重叠,所以看不出来。
+        context.depth_mask(true);
+        context.enable(WebGl2RenderingContext::DEPTH_TEST);
         context.disable(WebGl2RenderingContext::BLEND);
         context.use_program(Some(&self.get_program()));
         context.uniform_matrix4fv_with_f32_array(
@@ -1444,6 +1710,8 @@ impl WebGlRenderer {
         context.uniform1f(self.get_uniform_emissive_gain(), lighting.emissive_gain);
         context.uniform2f(self.get_uniform_fog(), lighting.fog_start, lighting.fog_end);
         context.uniform3f(self.get_uniform_eye(), eye[0], eye[1], eye[2]);
+        context.uniform1f(self.get_uniform_exposure(), lighting.exposure);
+        context.uniform1f(self.get_uniform_tone_map_white(), lighting.tone_map_white);
 
         let mut drawn_triangles: u32 = 0;
         let hidden: Vec<usize> = crate::game::hidden_batches();
@@ -1452,33 +1720,38 @@ impl WebGlRenderer {
                 continue;
             }
             // 近处遮挡剔除(见 `NEAR_CULL_RADIUS` 的说明)。
-            let all_near: bool = batch
-                .instances
-                .iter()
-                .all(|inst: &Instance| instance_distance(inst, eye) < NEAR_CULL_RADIUS);
-            if all_near {
-                continue;
-            }
-            if batch
-                .instances
-                .iter()
-                .any(|inst: &Instance| instance_distance(inst, eye) < NEAR_CULL_RADIUS)
-            {
-                // 整批都在近平面之外(常见情况:一排路灯 / 一排行道树),
-                // 就地过滤一次,避免为了剔一两个实例而重新分配。
-                let mut kept: Vec<Instance> = std::mem::take(self.get_scratch_mut());
-                kept.clear();
-                kept.extend(
-                    batch
-                        .instances
-                        .iter()
-                        .filter(|inst: &&Instance| instance_distance(inst, eye) >= NEAR_CULL_RADIUS)
-                        .copied(),
-                );
-                let tris: u32 = self.draw_batch(batch.mesh_index, &kept);
-                self.set_scratch(kept);
-                drawn_triangles += tris;
-                continue;
+            // `near_cull == false` 的批次(玩家骨架、车辆)完全豁免。
+            if batch.near_cull {
+                let all_near: bool = batch
+                    .instances
+                    .iter()
+                    .all(|inst: &Instance| instance_distance(inst, eye) < near_cull_radius);
+                if all_near {
+                    continue;
+                }
+                if batch
+                    .instances
+                    .iter()
+                    .any(|inst: &Instance| instance_distance(inst, eye) < near_cull_radius)
+                {
+                    // 整批都在近平面之外(常见情况:一排路灯 / 一排行道树),
+                    // 就地过滤一次,避免为了剔一两个实例而重新分配。
+                    let mut kept: Vec<Instance> = std::mem::take(self.get_scratch_mut());
+                    kept.clear();
+                    kept.extend(
+                        batch
+                            .instances
+                            .iter()
+                            .filter(|inst: &&Instance| {
+                                instance_distance(inst, eye) >= near_cull_radius
+                            })
+                            .copied(),
+                    );
+                    let tris: u32 = self.draw_batch(batch.mesh_index, &kept);
+                    self.set_scratch(kept);
+                    drawn_triangles += tris;
+                    continue;
+                }
             }
             drawn_triangles += self.draw_batch(batch.mesh_index, &batch.instances);
         }
@@ -1502,18 +1775,19 @@ impl WebGlRenderer {
                 if !batch.opaque || batch.instances.is_empty() || hidden.contains(&bi) {
                     continue;
                 }
-                let all_near: bool = batch
-                    .instances
-                    .iter()
-                    .all(|inst: &Instance| instance_distance(inst, eye) < NEAR_CULL_RADIUS);
+                let all_near: bool = !batch.near_cull
+                    || batch
+                        .instances
+                        .iter()
+                        .all(|inst: &Instance| instance_distance(inst, eye) < near_cull_radius);
                 if all_near {
                     continue;
                 }
                 let any_near: bool = batch
                     .instances
                     .iter()
-                    .any(|inst: &Instance| instance_distance(inst, eye) < NEAR_CULL_RADIUS);
-                if any_near {
+                    .any(|inst: &Instance| instance_distance(inst, eye) < near_cull_radius);
+                if any_near && batch.near_cull {
                     let mut kept: Vec<Instance> = std::mem::take(self.get_scratch_mut());
                     kept.clear();
                     kept.extend(
@@ -1521,7 +1795,7 @@ impl WebGlRenderer {
                             .instances
                             .iter()
                             .filter(|inst: &&Instance| {
-                                instance_distance(inst, eye) >= NEAR_CULL_RADIUS
+                                instance_distance(inst, eye) >= near_cull_radius
                             })
                             .copied(),
                     );
@@ -1604,6 +1878,22 @@ impl WebGlRenderer {
             data.resize(before + FLOATS_PER_INSTANCE, 0.0);
         }
         debug_assert_eq!(data.len(), count * FLOATS_PER_INSTANCE);
+        // **`bind_vertex_array` 必须排在 `bind_buffer` 前面。**
+        //
+        // VAO 里存着实例属性的 `vertexAttribPointer` —— 也就是「这个
+        // attribute 从 instance buffer 的第几字节读」。那个 pointer 是
+        // 在 `upload_mesh` 时、对着**当时绑定的 buffer** 记下来的,而且
+        // `ELEMENT_ARRAY_BUFFER` 的绑定也是 VAO 状态的一部分。
+        // 先 `bind_buffer(ARRAY_BUFFER)` 再 `bind_vertex_array`,等于
+        // 先把全局 ARRAY_BUFFER 指针挪走、再让 VAO 接管:这一次
+        // `buffer_sub_data` 写进去的 instance 数据没有任何 VAO 的
+        // attribute pointer 指向它,GPU 读到的是上一次残留的内容。
+        // 对多实例批次只是偶尔错位,对每帧只写 1 个实例的**玩家骨架**
+        // 尤其致命:13 个 limb 批次共用一个 instance buffer,残留的
+        // model matrix 会被当成角色的矩阵用,结果是一堆从原点放射的
+        // 巨大楔形三角形糊满整屏(实测整屏被涂成单色 `135,179,190`,
+        // 隐藏任意一个 limb 批次画面就恢复)。
+        context.bind_vertex_array(Some(&vertex_array));
         context.bind_buffer(
             WebGl2RenderingContext::ARRAY_BUFFER,
             Some(&self.get_instance_buffer()),
@@ -1613,7 +1903,6 @@ impl WebGlRenderer {
             0,
             f32_slice_to_bytes(&data),
         );
-        context.bind_vertex_array(Some(&vertex_array));
         context.bind_buffer(
             WebGl2RenderingContext::ELEMENT_ARRAY_BUFFER,
             Some(&index_buffer),
